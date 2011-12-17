@@ -200,3 +200,25 @@ VDR Plugin 'dynamite' Revision History
 2011-10-27: Version 0.0.8c
 
 - correct call of the idle hook
+
+2011-12-04: Version 0.0.8d
+
+- allow disable of auto-idle per device via Service/SVDRP/udev
+
+2011-12-08: Version 0.0.8e
+
+- fix a possible double attach of devices if they have a cardindex set with udev
+
+2011-12-10: Version 0.0.8f
+
+- try to set the initial channel on device-attach if it hasn't been set so far
+  and the user or a timer hasn't selected another channel
+  (giving up 60 seconds after startup)
+
+2011-12-11: Version 0.0.8g
+
+- if the initial channel is empty, the "current channel" is the "startup channel"
+
+2011-12-15: Version 0.0.8h
+
+- correct define for new virtual functions added by yaVDR-patches
