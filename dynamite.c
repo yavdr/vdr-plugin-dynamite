@@ -11,7 +11,7 @@
 #include "monitor.h"
 #include "status.h"
 
-static const char *VERSION        = "0.0.9";
+static const char *VERSION        = "0.0.9a";
 static const char *DESCRIPTION    = tr("attach/detach devices on the fly");
 static const char *MAINMENUENTRY  = NULL;
 
@@ -290,6 +290,7 @@ bool cPluginDynamite::Initialize(void)
   // look for all dvb devices
   cList<cUdevDevice> *devices = cUdev::EnumDevices("dvb", "DVB_DEVICE_TYPE", "frontend");
   if (devices != NULL) {
+     devices->Sort();
      int dummy = 0;
      for (cUdevDevice *d = devices->First(); d; d = devices->Next(d)) {
          const char *devpath = d->GetDevnode();

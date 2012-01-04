@@ -5,6 +5,8 @@
 #include <vdr/skins.h>
 #include <vdr/transfer.h>
 
+#define SUBDEVICEREADYTIMEOUT    30 // seconds to wait until subdevice is ready
+
 cPlugin *cDynamicDevice::dynamite = NULL;
 int cDynamicDevice::defaultGetTSTimeout = 0;
 int cDynamicDevice::idleTimeoutMinutes = 0;
@@ -53,8 +55,6 @@ int cDynamicDevice::IndexOf(const char *DevPath, int &NextFreeIndex, int WishInd
   int index = -1;
   for (int i = 0; (i < numDynamicDevices) && ((index < 0) || (NextFreeIndex < 0) || (WishIndex >= 0)); i++) {
       if (dynamicdevice[i]->devpath == NULL) {
-         if (WishIndex >= 0)
-            isyslog("dynamite: device at slot %d has cardindex %d", i + 1, dynamicdevice[i]->CardIndex());
          if ((NextFreeIndex < 0) || ((WishIndex >= 0) && (dynamicdevice[i]->CardIndex() == WishIndex))) {
             NextFreeIndex = i;
             if ((dynamicdevice[i]->CardIndex() == WishIndex) && (index >= 0))
@@ -183,12 +183,16 @@ cString cDynamicDevice::AttachDevicePattern(const char *Pattern)
 {
   if (!Pattern)
      return "invalid pattern";
+  cStringList paths;
   cString reply;
   glob_t result;
   if (glob(Pattern, GLOB_MARK, 0, &result) == 0) {
-     for (uint i = 0; i < result.gl_pathc; i++) {
-         cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcAttach, result.gl_pathv[i]);
-         reply = cString::sprintf("%squeued %s for attaching\n", (i == 0) ? "" : *reply, result.gl_pathv[i]);
+     for (uint g = 0; g < result.gl_pathc; g++)
+         paths.Append(strdup(result.gl_pathv[g]));
+     paths.Sort(false);
+     for (int i = 0; i < paths.Size(); i++) {
+         cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcAttach, paths[i]);
+         reply = cString::sprintf("%squeued %s for attaching\n", (i == 0) ? "" : *reply, paths[i]);
          }
      }
   globfree(&result);
@@ -201,15 +205,22 @@ eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath, int D
      return ddrcNotSupported;
 
   cMutexLock lock(&arrayMutex);
+  int freeIndex = -1;
+  int index = -1;
+  bool isDvbDevice = false;
+  int adapter = -1;
+  int frontend = -1;
   int wishIndex = -1;
   int attachDelay = 0;
   GetUdevAttributesForAttach(DevPath, wishIndex, attachDelay);
   if (wishIndex >= 0)
      isyslog("dynamite: %s wants card index %d", DevPath, wishIndex);
-  int freeIndex = -1;
-  int index = IndexOf(DevPath, freeIndex, wishIndex);
-  int adapter = -1;
-  int frontend = -1;
+  else if (sscanf(DevPath, "/dev/dvb/adapter%d/frontend%d", &adapter, &frontend) == 2) {
+     isDvbDevice = false;
+     wishIndex = adapter;
+     isyslog("dynamite: %s is a dvb adapter trying to set card index to %d", DevPath, wishIndex);
+     }
+  index = IndexOf(DevPath, freeIndex, wishIndex);
 
   if (index >= 0) {
      isyslog("dynamite: %s is already attached", DevPath);
@@ -257,7 +268,7 @@ eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath, int D
       }
 
   // if it's a dvbdevice try the DvbDeviceProbes as a fallback for unpatched plugins
-  if (sscanf(DevPath, "/dev/dvb/adapter%d/frontend%d", &adapter, &frontend) == 2) {
+  if (isDvbDevice || (sscanf(DevPath, "/dev/dvb/adapter%d/frontend%d", &adapter, &frontend) == 2)) {
      for (cDvbDeviceProbe *dp = DvbDeviceProbes.First(); dp; dp = DvbDeviceProbes.Next(dp)) {
          if (dp != dvbprobe) {
             if (dp->Probe(adapter, frontend))
@@ -272,9 +283,27 @@ eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath, int D
   return ddrcNotSupported;
 
 attach:
-  dynamicdevice[freeIndex]->lastCloseDvr = time(NULL);
-  while (!dynamicdevice[freeIndex]->Ready())
-        cCondWait::SleepMs(2);
+  int retry = 3;
+  do {
+     dynamicdevice[freeIndex]->lastCloseDvr = time(NULL);
+     for (time_t t0 = time(NULL); time(NULL) - t0 < SUBDEVICEREADYTIMEOUT; ) {
+         if (dynamicdevice[freeIndex]->Ready()) {
+            retry = -1;
+            break;
+            }
+         cCondWait::SleepMs(100);
+         }
+     if (!dynamicdevice[freeIndex]->Ready() && dynamicdevice[freeIndex]->HasCi() && (retry > 0)) {
+        retry--;
+        isyslog("dynamite: device %s not ready after %d seconds - resetting CAMs (retry == %d)", DevPath, SUBDEVICEREADYTIMEOUT, retry);
+        for (cCamSlot* cs = CamSlots.First(); cs; cs = CamSlots.Next(cs)) {
+            if ((cs->Device() == dynamicdevice[freeIndex]) || (cs->Device() == NULL))
+               cs->Reset();
+            }
+        }
+     else
+        break;
+     } while (retry >= 0);
   dynamicdevice[freeIndex]->devpath = new cString(DevPath);
   isyslog("dynamite: attached device %s to dynamic device slot %d", DevPath, freeIndex + 1);
   dynamicdevice[freeIndex]->ReadUdevProperties();
@@ -291,6 +320,7 @@ attach:
      if (!WIFEXITED(status) || WEXITSTATUS(status))
         esyslog("SystemExec() failed with status %d", status);
      }
+  dynamicdevice[freeIndex]->subDeviceIsReady = true;
   return ddrcSuccess;
 }
 
@@ -529,6 +559,7 @@ bool cDynamicDevice::IsAttached(const char *DevPath)
 
 cDynamicDevice::cDynamicDevice()
 :index(-1)
+,subDeviceIsReady(false)
 ,devpath(NULL)
 ,udevRemoveSyspath(NULL)
 ,getTSTimeoutHandlerArg(NULL)
@@ -624,6 +655,7 @@ void cDynamicDevice::InternSetLock(bool Lock)
 
 void cDynamicDevice::DeleteSubDevice()
 {
+  subDeviceIsReady = false;
   if (subDevice) {
      Cancel(3);
      if (cTransferControl::ReceiverDevice() == this)
@@ -1089,7 +1121,7 @@ void cDynamicDevice::CloseDvr(void)
 
 bool cDynamicDevice::GetTSPacket(uchar *&Data)
 {
-  if (subDevice) {
+  if (subDeviceIsReady && subDevice) {
      bool r = subDevice->GetTSPacket(Data);
      if (getTSTimeout > 0) {
         if (Data == NULL) {
