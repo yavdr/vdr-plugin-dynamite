@@ -11,21 +11,40 @@ enum eDynamicDeviceReturnCode { ddrcSuccess,
                                 ddrcIsPrimaryDevice,
                                 ddrcIsReceiving,
                                 ddrcNotAllowed,
-                                ddrcNotSupported
+                                ddrcNotSupported,
+                                ddrcAttachDelayed
                              };
 
 class cDynamicDevice : public cDevice {
  friend class cPluginDynamite;
 private:
+  class cDelayedDeviceItems : public cListObject {
+  private:
+    static cList<cDelayedDeviceItems> delayedItems;
+
+    cString devPath;
+    time_t  dontAttachBefore;
+
+  public:
+    cDelayedDeviceItems(const char *DevPath, int AttachDelay);
+
+    static int CanBeAttached(const char *DevPath);
+       ///< Returns 0 if delay has not expired,
+       ///<         1 if delay has expired,
+       ///<         2 if no delay is given
+  };
+
   static cPlugin *dynamite;
   static int defaultGetTSTimeout;
   static int idleTimeoutMinutes;
   static int idleWakeupHours;
   static cString *idleHook;
+  static cString *attachHook;
 
   static int numDynamicDevices;
   static cMutex arrayMutex;
   static cDynamicDevice *dynamicdevice[MAXDEVICES];
+  static cList<cDynamicDeviceProbe::cDynamicDeviceProbeItem> commandRequeue;
 public:
   static cDvbDeviceProbe *dvbprobe;
   static bool enableOsdMessages;
@@ -34,11 +53,11 @@ public:
          ///< Returns the total number of dynamic devices.
   static cDynamicDevice *GetDynamicDevice(int Index);
   static bool ProcessQueuedCommands(void);
-  static int GetProposedCardIndex(const char *DevPath);
+  static int GetUdevAttributesForAttach(const char *DevPath, int &CardIndex, int &AttachDelay);
   static void DetachAllDevices(bool Force);
   static cString ListAllDevices(int &ReplyCode); // for SVDRP command LSTD
   static cString AttachDevicePattern(const char *Pattern);
-  static eDynamicDeviceReturnCode AttachDevice(const char *DevPath);
+  static eDynamicDeviceReturnCode AttachDevice(const char *DevPath, int Delayed);
   static eDynamicDeviceReturnCode DetachDevice(const char *DevPath, bool Force);
   static eDynamicDeviceReturnCode SetLockDevice(const char *DevPath, bool Lock);
   static eDynamicDeviceReturnCode SetIdle(const char *DevPath, bool Idle);
@@ -50,6 +69,7 @@ public:
   static bool IsAttached(const char *DevPath);
 private:
   int index;
+  bool subDeviceIsReady;
   cString *devpath;
   cString *udevRemoveSyspath;
   cString *getTSTimeoutHandlerArg;
@@ -86,8 +106,13 @@ public:
   virtual int SignalStrength(void) const;
   virtual int SignalQuality(void) const;
   virtual const cChannel *GetCurrentlyTunedTransponder(void) const;
+#if VDRVERSNUM < 10722
   virtual bool IsTunedToTransponder(const cChannel *Channel);
   virtual bool MaySwitchTransponder(void);
+#else
+  virtual bool IsTunedToTransponder(const cChannel *Channel) const;
+  virtual bool MaySwitchTransponder(const cChannel *Channel) const;
+#endif
 protected:
   virtual bool SetChannelDevice(const cChannel *Channel, bool LiveView);
 public:
@@ -140,12 +165,16 @@ protected:
   virtual void CloseDvr(void);
   virtual bool GetTSPacket(uchar *&Data);
   
-#ifdef YAVDR_PATCHES
-//opt-21_internal-cam-devices.dpatch
+#ifdef INTERNAL_CAM_DEVICES_PATCH
   virtual bool HasInternalCam(void);
-//opt-44_rotor.dpatch 
+#endif
+
+#ifdef YAVDR_PATCHES
+//opt-44_rotor
   virtual bool SendDiseqcCmd(dvb_diseqc_master_cmd cmd);
-//opt-64_lnb-sharing.dpatch 
+#endif
+
+#ifdef LNB_SHARING_VERSION
   virtual void SetLnbNrFromSetup(void);
   virtual int LnbNr(void) const;
   virtual bool IsShareLnb(const cDevice *Device);
