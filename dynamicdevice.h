@@ -72,6 +72,7 @@ private:
   bool subDeviceIsReady;
   cString *devpath;
   cString *udevRemoveSyspath;
+  cString *udevProvidesSources;
   cString *getTSTimeoutHandlerArg;
   bool     isDetachable;
   time_t   getTSWatchdog;
@@ -83,6 +84,7 @@ private:
   void InternSetGetTSTimeout(int Seconds);
   void InternSetGetTSTimeoutHandlerArg(const char *Arg);
   void InternSetLock(bool Lock);
+  bool InternProvidesSource(int Source) const;
 public:
   cDynamicDevice();
   const char *GetDevPath(void) const;
