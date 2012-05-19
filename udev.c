@@ -50,6 +50,15 @@ cUdevDevice::~cUdevDevice(void)
      udev_device_unref(device);
 }
 
+int cUdevDevice::Compare(const cListObject &ListObject) const
+{
+  const char *n1 = GetDevnode();
+  const char *n2 = ((cUdevDevice*)&ListObject)->GetDevnode();
+  if ((n1 != NULL) && (n2 != NULL))
+     return strcmp(n1, n2);
+  return 0;
+}
+
 const char  *cUdevDevice::GetAction(void) const
 {
   if (device == NULL)
@@ -74,6 +83,13 @@ const char  *cUdevDevice::GetDevnode(void) const
   return udev_device_get_devnode(device);
 }
 
+const char  *cUdevDevice::GetDevpath(void) const
+{
+  if (device == NULL)
+     return false;
+  return udev_device_get_devpath(device);
+}
+
 cUdevDevice *cUdevDevice::GetParent(void) const
 {
   if (device == NULL)
@@ -89,6 +105,20 @@ const char *cUdevDevice::GetPropertyValue(const char *Key) const
   if (device == NULL)
      return false;
   return udev_device_get_property_value(device, Key);
+}
+
+const char *cUdevDevice::GetSubsystem(void) const
+{
+  if (device == NULL)
+     return false;
+  return udev_device_get_subsystem(device);
+}
+
+const char *cUdevDevice::GetSysname(void) const
+{
+  if (device == NULL)
+     return false;
+  return udev_device_get_sysname(device);
 }
 
 const char *cUdevDevice::GetSyspath(void) const
@@ -170,7 +200,7 @@ cList<cUdevDevice> *cUdev::EnumDevices(const char *Subsystem, const char *Proper
         }
      l = udev_enumerate_get_list_entry(e);
      if (l == NULL) {
-        esyslog("dynamite: can't get list of devices");
+        isyslog("dynamite: no devices found for %s/%s=%s", Subsystem, Property, Value);
         goto unref;
         }
      listEntry = new cUdevListEntry(l);

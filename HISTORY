@@ -192,3 +192,71 @@ VDR Plugin 'dynamite' Revision History
 2011-09-21: Version 0.0.8a
 
 - add SVDRP/Service commands SetIdleTimeout and SetIdleWakeup to modify the values on the fly
+
+2011-10-26: Version 0.0.8b
+
+- add udev monitor for remove events of usb hardware so devices can be detached on unplugging
+
+2011-10-27: Version 0.0.8c
+
+- correct call of the idle hook
+
+2011-12-04: Version 0.0.8d
+
+- allow disable of auto-idle per device via Service/SVDRP/udev
+
+2011-12-08: Version 0.0.8e
+
+- fix a possible double attach of devices if they have a cardindex set with udev
+
+2011-12-10: Version 0.0.8f
+
+- try to set the initial channel on device-attach if it hasn't been set so far
+  and the user or a timer hasn't selected another channel
+  (giving up 60 seconds after startup)
+
+2011-12-11: Version 0.0.8g
+
+- if the initial channel is empty, the "current channel" is the "startup channel"
+
+2011-12-15: Version 0.0.8h
+
+- correct define for new virtual functions added by yaVDR-patches
+
+2011-12-15: Version 0.0.8i
+
+- add udev attribute "dynamite_attach_delay" for delaying the attach of specific devices
+  useful for device if the firmware upload needs some time
+
+2011-12-15: Version 0.0.8j
+
+- add attach-hook, argument is --device=/dev/path
+
+2011-12-21: Version 0.0.8k
+
+- call attach-hook on detach, too, argument is --action=detach --device=/dev/path
+  arguments for call on attach has changed to --action=attach --device=/dev/path
+
+2011-12-21: Version 0.0.9
+
+- adjust to vdr 1.7.22
+
+2011-12-21: Version 0.0.9a
+
+- reset CAMs if device will not get ready on attach
+
+2012-02-05: Version 0.0.9b
+
+- add udev attribute "dynamite_sources" which will limit the reception of the device to the given sources
+
+2012-03-08: Version 0.0.9c
+
+- on "force detach" queue command, don't delete directly on the call
+
+2012-03-28: Version 0.0.9d
+
+- adjust to vdr 1.7.27
+
+2012-03-29: Version 0.0.9e
+
+- re-new the device bonding if a device is attached

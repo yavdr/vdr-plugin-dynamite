@@ -128,6 +128,14 @@ SetIdle /dev/path/to/device
 SetNotIdle /dev/path/to/device
     Revoke the idle state of the device
 
+"dynamite-DisableAutoIdle-v0.1"
+DisableAutoIdle /dev/path/to/device
+    Disables the auto-idle feature on this device
+
+"dynamite-EnableAutoIdle-v0.1"
+EnableAutoIdle /dev/path/to/device
+    Enables the auto-idle feature on this device if the timeout configured
+
 (no Service-interface)
 LSTD
     Lists all devices managed by this plugin. The first column is an id,
@@ -189,6 +197,7 @@ The main menu item "dynamite" offers the following possibilities:
 - scan for new DVB devices
 - detach device
 - lock/unlock device
+- disable/enable auto-idle of device
 - switch device to idle
 
 Signals emitted via cPluginManager::CallAllServices
@@ -207,6 +216,7 @@ Parameters in setup.conf
 dynamite.DefaultGetTSTimeout = 0
 dynamite.GetTSTimeoutHandler = /path/to/program
 dynamite.FreeDeviceSlots = 0
+dynamite.AttachHook = /path/to/program
 dynamite.IdleHook = /path/to/program
 dynamite.IdleTimeout = 0
 dynamite.IdleWakeup = 0
@@ -224,12 +234,22 @@ Commandline Arguments
 -f, --free-device-slots=n
         leave n slots free for non-dynamic devices of
         incompatible plugins
+-a, --attach-hook=/path/to/program
+        set program to be called on device attach/detach
 -i, --idle-hook=/path/to/program
         set program to be called on SetIdle and reactivation
 -I, --idle-timeout=m
         if a device is unused for m minutes set it to idle, 0 disables auto-idle (default)
 -W, --idle-wakeup=h
         if a device is idle for h hours wake it up (e.g. for EPG scan)
+
+Attach hook
+-----------
+If you want 'special action' taken after a device is attached or detached
+to vdr you can specify a program either with the commandline parameter
+"--attach-hook=/path/to/program" or with an entry in the setup.conf
+dynamite.AttachHook = /path/to/program
+It will be called with the parameter "--action=[attach|detach] --device=/dev/path".
 
 Idle mode
 ---------
@@ -252,6 +272,9 @@ OpenDvr got called at all).
 After a minimum of "idle-wakeup" hours the device will be reactivated so it can
 be used by the EIT scanner or similar modules. The wakeup cannot be disabled,
 only a minimum of one hour can be specified.
+If there are problems with the auto-idle mode on some devices but you want to use
+it on your other devices you can disable it per device via "Service", SVDRP or
+udev (see below).
 
 "GetTS" watchdog
 ----------------
@@ -272,10 +295,13 @@ Add a rule which sets with ENV{dynamite_timeout}="10" the needed timeout value.
 example for udev rule:
 ACTION=="add", SUBSYSTEM=="dvb", ENV{DVB_DEVICE_TYPE}=="frontend" \
   , ENV{dynamite_attach}="yes" \
+  , ENV{dynamite_attach_delay}="10" \
   , ENV{dynamite_instanceid}="0" \
   , ENV{dynamite_cardindex}="5" \
+  , ENV{dynamite_sources}="C,T" \
   , ENV{dynamite_timeout}="10" \
-  , ENV{dynamite_timeout_handler_arg}="%k"
+  , ENV{dynamite_timeout_handler_arg}="%k" \
+  , ENV{dynamite_disable_autoidle}="no"
 
 After the device is detached and dynamite.GetTSTimeoutHandler in setup.conf is set
 to a path, this program is called. If the udev-property "dynamite_timeout_handler_arg"
@@ -287,13 +313,31 @@ Attaching of devices can be controlled with some udev device properties which ca
 set by a udev rule (see example above).
 
 dynamite_attach
-    "no", "n", "0", "ignore": don't attach this device, every other string will be like "yes"
+    "no", "n", "0", "ignore": don't attach this device, any other string will be like "yes"
+
+dynamite_attach_delay
+    n: wait with attaching this device at least n seconds
 
 dynamite_instanceid
     n: attach only at vdr with matching instance id
 
 dynamite_cardindex
     n: if possible attach at slot with given cardindex
+       if no cardindex is given, the adapter number will be used (see "Known issues")
+
+dynamite_disable_autoidle
+    "yes", "y", "disable", "true", "1": disable the auto-idle feature on this device, any other
+                                        string or missing of this property will activate the
+                                        auto-idle feature if configured
+
+dynamite_sources
+    comma separated list of strings from sources.conf
+    dynamite will deny all channels from other sources for the subdevice.
+    If this variable is missing the subdevice is asked as usual.
+    This is useful for hybrid devices which supports multiple delivery systems
+    but only one is connected. Or if you have to dishes to different satellites
+    connected to two cards.
+    It will NOT switch the delivery system on dvb-cards, this is up to the device itself!
 
 dynamite_timeout
     n: set GetTS timeout in seconds on this device
@@ -308,6 +352,9 @@ detached. That would imply that vdr searches for a new primary device
 or should be forced to transfer mode or something else. Since I don't
 know anything about this you have to wait for this feature or teach
 me how to do this...
+
+The "no cardindex given" default mechanism doesn't count frontends with
+numbers > 0. Make sure you have one frontend per adapter.
 
 TODO
 ----

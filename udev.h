@@ -24,12 +24,16 @@ private:
 public:
   cUdevDevice(udev_device *Device, bool DoUnref = true);
   virtual ~cUdevDevice(void);
+  virtual int Compare(const cListObject &ListObject) const;
 
   const char  *GetAction(void) const;
   cUdevListEntry *GetDevlinksList(void) const;
   const char  *GetDevnode(void) const;
+  const char  *GetDevpath(void) const;
   cUdevDevice *GetParent(void) const;
   const char  *GetPropertyValue(const char *Key) const;
+  const char  *GetSubsystem(void) const;
+  const char  *GetSysname(void) const;
   const char  *GetSyspath(void) const;
   };
 

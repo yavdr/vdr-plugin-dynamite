@@ -1,19 +1,52 @@
 #include "dynamicdevice.h"
-#include "udev.h"
+#include "monitor.h"
+#include "status.h"
 #include <glob.h>
 #include <vdr/skins.h>
 #include <vdr/transfer.h>
+
+#define SUBDEVICEREADYTIMEOUT    30 // seconds to wait until subdevice is ready
 
 cPlugin *cDynamicDevice::dynamite = NULL;
 int cDynamicDevice::defaultGetTSTimeout = 0;
 int cDynamicDevice::idleTimeoutMinutes = 0;
 int cDynamicDevice::idleWakeupHours = 0;
 cString *cDynamicDevice::idleHook = NULL;
+cString *cDynamicDevice::attachHook = NULL;
 cDvbDeviceProbe *cDynamicDevice::dvbprobe = NULL;
 bool cDynamicDevice::enableOsdMessages = false;
 int cDynamicDevice::numDynamicDevices = 0;
 cMutex cDynamicDevice::arrayMutex;
 cDynamicDevice *cDynamicDevice::dynamicdevice[MAXDEVICES] = { NULL };
+cList<cDynamicDeviceProbe::cDynamicDeviceProbeItem> cDynamicDevice::commandRequeue;
+
+cList<cDynamicDevice::cDelayedDeviceItems> cDynamicDevice::cDelayedDeviceItems::delayedItems;
+
+cDynamicDevice::cDelayedDeviceItems::cDelayedDeviceItems(const char *DevPath, int AttachDelay)
+ :devPath(DevPath)
+{
+ dontAttachBefore = time(NULL) + AttachDelay;
+ delayedItems.Add(this);
+}
+
+int cDynamicDevice::cDelayedDeviceItems::CanBeAttached(const char *DevPath)
+{
+  if (DevPath == NULL)
+     return false;
+  time_t now = time(NULL);
+  for (cDelayedDeviceItems *item = delayedItems.First(); item; item = delayedItems.Next(item)) {
+      if (strcmp(*item->devPath, DevPath) == 0) {
+         if (item->dontAttachBefore < now) {
+            delayedItems.Del(item);
+            isyslog("dynamite: %s can be attached now", DevPath);
+            return 1;
+            }
+         dsyslog("dynamite: %s should not be attached yet", DevPath);
+         return 0;
+         }
+      }
+  return 2;
+}
 
 int cDynamicDevice::IndexOf(const char *DevPath, int &NextFreeIndex, int WishIndex)
 {
@@ -22,11 +55,9 @@ int cDynamicDevice::IndexOf(const char *DevPath, int &NextFreeIndex, int WishInd
   int index = -1;
   for (int i = 0; (i < numDynamicDevices) && ((index < 0) || (NextFreeIndex < 0) || (WishIndex >= 0)); i++) {
       if (dynamicdevice[i]->devpath == NULL) {
-         if (WishIndex >= 0)
-            isyslog("dynamite: device at slot %d has cardindex %d", i + 1, dynamicdevice[i]->CardIndex());
          if ((NextFreeIndex < 0) || ((WishIndex >= 0) && (dynamicdevice[i]->CardIndex() == WishIndex))) {
             NextFreeIndex = i;
-            if (dynamicdevice[i]->CardIndex() == WishIndex)
+            if ((dynamicdevice[i]->CardIndex() == WishIndex) && (index >= 0))
                break;
             }
          }
@@ -51,7 +82,11 @@ bool cDynamicDevice::ProcessQueuedCommands(void)
       switch (dev->cmd) {
          case ddpcAttach:
           {
-           AttachDevice(*dev->devpath);
+           int delayed = cDelayedDeviceItems::CanBeAttached(*dev->devpath);
+           if (delayed == 0)
+              commandRequeue.Add(new cDynamicDeviceProbe::cDynamicDeviceProbeItem(ddpcAttach, new cString(*dev->devpath)));
+           else if (delayed > 0)
+              AttachDevice(*dev->devpath, delayed);
            break;
           }
          case ddpcDetach:
@@ -77,24 +112,38 @@ bool cDynamicDevice::ProcessQueuedCommands(void)
         }
       }
   cDynamicDeviceProbe::commandQueue.Clear();
+  for (cDynamicDeviceProbe::cDynamicDeviceProbeItem *dev = commandRequeue.First(); dev; dev = commandRequeue.Next(dev))
+      cDynamicDeviceProbe::commandQueue.Add(new cDynamicDeviceProbe::cDynamicDeviceProbeItem(dev->cmd, new cString(**dev->devpath)));
+  commandRequeue.Clear();
   return true;
 }
 
-int cDynamicDevice::GetProposedCardIndex(const char *DevPath)
+int cDynamicDevice::GetUdevAttributesForAttach(const char *DevPath, int &CardIndex, int &AttachDelay)
 {
-  int cardindex = -1;
+  CardIndex = -1;
+  AttachDelay = 0;
   if (DevPath == NULL)
-     return cardindex;
+     return -1;
   cUdevDevice *dev = cUdev::GetDeviceFromDevName(DevPath);
-  if (dev != NULL) {
-     const char *val = dev->GetPropertyValue("dynamite_cardindex");
+  if (dev == NULL)
+     return -1;
+  int intVal;
+  const char *val = dev->GetPropertyValue("dynamite_cardindex");
+  if (val) {
      isyslog("dynamite: udev cardindex is %s", val);
-     int intVal = -1;
+     intVal = -1;
      if (val && (sscanf(val, "%d", &intVal) == 1) && (intVal >= 0) && (intVal <= MAXDEVICES))
-        cardindex = intVal;
-     delete dev;
+        CardIndex = intVal;
      }
-  return cardindex;
+  val = dev->GetPropertyValue("dynamite_attach_delay");
+  if (val) {
+     isyslog("dynamite: udev attach_delay is %s", val);
+     intVal = 0;
+     if (val && (sscanf(val, "%d", &intVal) == 1) && (intVal > 0))
+        AttachDelay = intVal;
+     }
+  delete dev;
+  return 0;
 }
 
 void cDynamicDevice::DetachAllDevices(bool Force)
@@ -102,10 +151,12 @@ void cDynamicDevice::DetachAllDevices(bool Force)
   cMutexLock lock(&arrayMutex);
   isyslog("dynamite: %sdetaching all devices", (Force ? "force " : ""));
   for (int i = 0; i < numDynamicDevices; i++) {
-      if (Force)
-         dynamicdevice[i]->DeleteSubDevice();
-      else if (dynamicdevice[i]->devpath)
-         cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcDetach, (**dynamicdevice[i]->devpath));
+      if (dynamicdevice[i]->devpath) {
+         if (Force)
+            cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcService, *cString::sprintf("dynamite-ForceDetachDevice-v0.1 %s", **dynamicdevice[i]->devpath));
+         else
+            cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcDetach, (**dynamicdevice[i]->devpath));
+         }
       }
 }
 
@@ -134,40 +185,59 @@ cString cDynamicDevice::AttachDevicePattern(const char *Pattern)
 {
   if (!Pattern)
      return "invalid pattern";
+  cStringList paths;
   cString reply;
   glob_t result;
   if (glob(Pattern, GLOB_MARK, 0, &result) == 0) {
-     for (uint i = 0; i < result.gl_pathc; i++) {
-         cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcAttach, result.gl_pathv[i]);
-         reply = cString::sprintf("%squeued %s for attaching\n", (i == 0) ? "" : *reply, result.gl_pathv[i]);
+     for (uint g = 0; g < result.gl_pathc; g++)
+         paths.Append(strdup(result.gl_pathv[g]));
+     paths.Sort(false);
+     for (int i = 0; i < paths.Size(); i++) {
+         cDynamicDeviceProbe::QueueDynamicDeviceCommand(ddpcAttach, paths[i]);
+         reply = cString::sprintf("%squeued %s for attaching\n", (i == 0) ? "" : *reply, paths[i]);
          }
      }
   globfree(&result);
   return reply;
 }
 
-eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath)
+eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath, int Delayed)
 {
   if (!DevPath)
      return ddrcNotSupported;
 
   cMutexLock lock(&arrayMutex);
-  int wishIndex = GetProposedCardIndex(DevPath);
-  if (wishIndex >= 0)
-     isyslog("dynamite: %s wants card index %d", DevPath, wishIndex);
   int freeIndex = -1;
-  int index = IndexOf(DevPath, freeIndex, wishIndex);
+  int index = -1;
+  bool isDvbDevice = false;
   int adapter = -1;
   int frontend = -1;
+  int wishIndex = -1;
+  int attachDelay = 0;
+  GetUdevAttributesForAttach(DevPath, wishIndex, attachDelay);
+  if (wishIndex >= 0)
+     isyslog("dynamite: %s wants card index %d", DevPath, wishIndex);
+  else if (sscanf(DevPath, "/dev/dvb/adapter%d/frontend%d", &adapter, &frontend) == 2) {
+     isDvbDevice = false;
+     wishIndex = adapter;
+     isyslog("dynamite: %s is a dvb adapter trying to set card index to %d", DevPath, wishIndex);
+     }
+  index = IndexOf(DevPath, freeIndex, wishIndex);
 
   if (index >= 0) {
-     esyslog("dynamite: %s is already attached", DevPath);
+     isyslog("dynamite: %s is already attached", DevPath);
      return ddrcAlreadyAttached;
      }
 
   if (freeIndex < 0) {
      esyslog("dynamite: no more free slots for %s", DevPath);
      return ddrcNoFreeDynDev;
+     }
+
+  if ((attachDelay > 0) && (Delayed > 1)) {
+     commandRequeue.Add(new cDynamicDeviceProbe::cDynamicDeviceProbeItem(ddpcAttach, new cString(DevPath)));
+     new cDelayedDeviceItems(DevPath, attachDelay);
+     return ddrcAttachDelayed;
      }
 
   cUdevDevice *dev = cUdev::GetDeviceFromDevName(DevPath);
@@ -200,7 +270,7 @@ eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath)
       }
 
   // if it's a dvbdevice try the DvbDeviceProbes as a fallback for unpatched plugins
-  if (sscanf(DevPath, "/dev/dvb/adapter%d/frontend%d", &adapter, &frontend) == 2) {
+  if (isDvbDevice || (sscanf(DevPath, "/dev/dvb/adapter%d/frontend%d", &adapter, &frontend) == 2)) {
      for (cDvbDeviceProbe *dp = DvbDeviceProbes.First(); dp; dp = DvbDeviceProbes.Next(dp)) {
          if (dp != dvbprobe) {
             if (dp->Probe(adapter, frontend))
@@ -215,17 +285,45 @@ eDynamicDeviceReturnCode cDynamicDevice::AttachDevice(const char *DevPath)
   return ddrcNotSupported;
 
 attach:
-  dynamicdevice[freeIndex]->lastCloseDvr = time(NULL);
-  while (!dynamicdevice[freeIndex]->Ready())
-        cCondWait::SleepMs(2);
+  int retry = 3;
+  do {
+     dynamicdevice[freeIndex]->lastCloseDvr = time(NULL);
+     for (time_t t0 = time(NULL); time(NULL) - t0 < SUBDEVICEREADYTIMEOUT; ) {
+         if (dynamicdevice[freeIndex]->Ready()) {
+            retry = -1;
+            break;
+            }
+         cCondWait::SleepMs(100);
+         }
+     if (!dynamicdevice[freeIndex]->Ready() && dynamicdevice[freeIndex]->HasCi() && (retry > 0)) {
+        retry--;
+        isyslog("dynamite: device %s not ready after %d seconds - resetting CAMs (retry == %d)", DevPath, SUBDEVICEREADYTIMEOUT, retry);
+        for (cCamSlot* cs = CamSlots.First(); cs; cs = CamSlots.Next(cs)) {
+            if ((cs->Device() == dynamicdevice[freeIndex]) || (cs->Device() == NULL))
+               cs->Reset();
+            }
+        }
+     else
+        break;
+     } while (retry >= 0);
   dynamicdevice[freeIndex]->devpath = new cString(DevPath);
   isyslog("dynamite: attached device %s to dynamic device slot %d", DevPath, freeIndex + 1);
   dynamicdevice[freeIndex]->ReadUdevProperties();
   cPluginManager::CallAllServices("dynamite-event-DeviceAttached-v0.1", (void*)DevPath);
+  cDvbDevice::BondDevices(Setup.DeviceBondings); // "re-bond"
   if (enableOsdMessages) {
      cString osdMsg = cString::sprintf(tr("attached %s"), DevPath);
      Skins.QueueMessage(mtInfo, *osdMsg);
      }
+  cDynamiteStatus::SetStartupChannel();
+  if (attachHook != NULL) {
+     cString hookCmd = cString::sprintf("%s --action=attach --device=%s", **attachHook, DevPath);
+     isyslog("dynamite: calling hook %s", *hookCmd);
+     int status = SystemExec(*hookCmd, true);
+     if (!WIFEXITED(status) || WEXITSTATUS(status))
+        esyslog("SystemExec() failed with status %d", status);
+     }
+  dynamicdevice[freeIndex]->subDeviceIsReady = true;
   return ddrcSuccess;
 }
 
@@ -247,28 +345,36 @@ eDynamicDeviceReturnCode cDynamicDevice::DetachDevice(const char *DevPath, bool 
      return ddrcNotFound;
      }
 
+  cString realDevPath(dynamicdevice[index]->GetDevPath());
   if (!Force) {
      if (!dynamicdevice[index]->isDetachable) {
-        esyslog("dynamite: detaching of device %s is not allowed", DevPath);
+        esyslog("dynamite: detaching of device %s is not allowed", *realDevPath);
         return ddrcNotAllowed;
         }
 
      if (dynamicdevice[index] == PrimaryDevice()) {
-        esyslog("dynamite: detaching of primary device %s is not supported", DevPath);
+        esyslog("dynamite: detaching of primary device %s is not supported", *realDevPath);
         return ddrcIsPrimaryDevice;
         }
 
      if (dynamicdevice[index]->Receiving(false)) {
-        esyslog("dynamite: can't detach device %s, it's receiving something important", DevPath);
+        esyslog("dynamite: can't detach device %s, it's receiving something important", *realDevPath);
         return ddrcIsReceiving;
         }
      }
 
   dynamicdevice[index]->DeleteSubDevice();
-  isyslog("dynamite: detached device %s%s", DevPath, (Force ? " (forced)" : ""));
+  isyslog("dynamite: detached device %s%s", *realDevPath, (Force ? " (forced)" : ""));
   if (enableOsdMessages) {
-     cString osdMsg = cString::sprintf(tr("detached %s"), DevPath);
+     cString osdMsg = cString::sprintf(tr("detached %s"), *realDevPath);
      Skins.QueueMessage(mtInfo, *osdMsg);
+     }
+  if (attachHook != NULL) {
+     cString hookCmd = cString::sprintf("%s --action=detach --device=%s", **attachHook, *realDevPath);
+     isyslog("dynamite: calling hook %s", *hookCmd);
+     int status = SystemExec(*hookCmd, true);
+     if (!WIFEXITED(status) || WEXITSTATUS(status))
+        esyslog("SystemExec() failed with status %d", status);
      }
   return ddrcSuccess;
 }
@@ -295,9 +401,11 @@ eDynamicDeviceReturnCode cDynamicDevice::SetLockDevice(const char *DevPath, bool
 
 static void CallIdleHook(const char *IdleHook, const char *DevPath, bool Idle)
 {
-  const char *idleHookCmd = *cString::sprintf("%s --idle=%s --device=%s", IdleHook, (Idle ? "on" : "off"), DevPath);
-  isyslog("dynamite: calling idle hook %s", idleHookCmd);
-  SystemExec(idleHookCmd, false);
+  cString idleHookCmd = cString::sprintf("%s --idle=%s --device=%s", IdleHook, (Idle ? "on" : "off"), DevPath);
+  isyslog("dynamite: calling idle hook %s", *idleHookCmd);
+  int status = SystemExec(*idleHookCmd, false);
+  if (!WIFEXITED(status) || WEXITSTATUS(status))
+     esyslog("SystemExec() failed with status %d", status);
 }
 
 eDynamicDeviceReturnCode cDynamicDevice::SetIdle(const char *DevPath, bool Idle)
@@ -336,6 +444,27 @@ eDynamicDeviceReturnCode cDynamicDevice::SetIdle(const char *DevPath, bool Idle)
   return ddrcSuccess;
 }
 
+eDynamicDeviceReturnCode cDynamicDevice::SetAutoIdle(const char *DevPath, bool Disable)
+{
+  if (!DevPath)
+     return ddrcNotSupported;
+
+  cMutexLock lock(&arrayMutex);
+  int freeIndex = -1;
+  int index = -1;
+  if (isnumber(DevPath))
+     index = strtol(DevPath, NULL, 10) - 1;
+  else
+     index = IndexOf(DevPath, freeIndex, -1);
+
+  if ((index < 0) || (index >= numDynamicDevices))
+     return ddrcNotFound;
+
+  isyslog("dynamite: %s auto-idle mode on device %s", (Disable ? "disable" : "enable"), DevPath);
+  dynamicdevice[index]->disableAutoIdle = Disable;
+  return ddrcSuccess;
+}
+
 void cDynamicDevice::AutoIdle(void)
 {
   if (idleTimeoutMinutes <= 0)
@@ -345,7 +474,7 @@ void cDynamicDevice::AutoIdle(void)
   bool wokeupSomeDevice = false;
   int seconds = 0;
   for (int i = 0; i < numDynamicDevices; i++) {
-      if (dynamicdevice[i]->devpath != NULL) {
+      if ((dynamicdevice[i]->devpath != NULL) && !dynamicdevice[i]->disableAutoIdle) {
          if (dynamicdevice[i]->IsIdle()) {
             seconds = now - dynamicdevice[i]->idleSince;
             if ((dynamicdevice[i]->idleSince > 0) && (seconds >= (idleWakeupHours * 3600))) {
@@ -433,11 +562,14 @@ bool cDynamicDevice::IsAttached(const char *DevPath)
 
 cDynamicDevice::cDynamicDevice()
 :index(-1)
+,subDeviceIsReady(false)
 ,devpath(NULL)
+,udevRemoveSyspath(NULL)
+,udevProvidesSources(NULL)
 ,getTSTimeoutHandlerArg(NULL)
 ,isDetachable(true)
 ,getTSTimeout(defaultGetTSTimeout)
-,restartSectionHandler(false)
+,disableAutoIdle(false)
 {
   index = numDynamicDevices;
   if (numDynamicDevices < MAXDEVICES) {
@@ -476,6 +608,33 @@ void cDynamicDevice::ReadUdevProperties(void)
      if (timeoutHandlerArg)
         InternSetGetTSTimeoutHandlerArg(timeoutHandlerArg);
 
+     const char *disableAutoIdleArg = dev->GetPropertyValue("dynamite_disable_autoidle");
+     if (disableAutoIdleArg && ((strcmp(disableAutoIdleArg, "y") == 0)
+                             || (strcmp(disableAutoIdleArg, "yes") == 0)
+                             || (strcmp(disableAutoIdleArg, "true") == 0)
+                             || (strcmp(disableAutoIdleArg, "disable") == 0)
+                             || (strcmp(disableAutoIdleArg, "1") == 0)))
+        disableAutoIdle = true;
+
+     const char *providesSources = dev->GetPropertyValue("dynamite_sources");
+     if (providesSources) {
+        if (udevProvidesSources)
+           delete udevProvidesSources;
+        udevProvidesSources = new cString(cString::sprintf(",%s,", providesSources));
+        }
+
+     cUdevDevice *p = dev->GetParent();
+     if (p) {
+        const char *subsystem = p->GetSubsystem();
+        const char *syspath = p->GetSyspath();
+        if (subsystem && syspath && (strcmp(subsystem, "usb") == 0)) {
+           cUdevUsbRemoveFilter::AddItem(syspath, **devpath);
+           if (udevRemoveSyspath)
+              delete udevRemoveSyspath;
+           udevRemoveSyspath = new cString(syspath);
+           }
+        }
+
      delete dev;
      }
 }
@@ -505,8 +664,22 @@ void cDynamicDevice::InternSetLock(bool Lock)
   isyslog("dynamite: %slocked device %s", Lock ? "" : "un", GetDevPath());
 }
 
+bool cDynamicDevice::InternProvidesSource(int Source) const
+{
+  if (udevProvidesSources) {
+     cString source = cSource::ToString(Source);
+     cString search = cString::sprintf(",%s,", *source);
+     if (strstr(**udevProvidesSources, *search) == NULL) {
+        isyslog("dynamite: device %s shall not provide source %s", GetDevPath(), *source);
+        return false;
+        }
+     }
+  return true;
+}
+
 void cDynamicDevice::DeleteSubDevice()
 {
+  subDeviceIsReady = false;
   if (subDevice) {
      Cancel(3);
      if (cTransferControl::ReceiverDevice() == this)
@@ -518,12 +691,22 @@ void cDynamicDevice::DeleteSubDevice()
      if (devpath)
         cPluginManager::CallAllServices("dynamite-event-DeviceDetached-v0.1", (void*)**devpath);
      }
+  if (udevRemoveSyspath) {
+     cUdevUsbRemoveFilter::RemoveItem(**udevRemoveSyspath, GetDevPath());
+     delete udevRemoveSyspath;
+     udevRemoveSyspath = NULL;
+     }
+  if (udevProvidesSources) {
+     delete udevProvidesSources;
+     udevProvidesSources = NULL;
+     }
   if (devpath) {
      delete devpath;
      devpath = NULL;
      }
   isDetachable = true;
   getTSTimeout = defaultGetTSTimeout;
+  disableAutoIdle = false;
 }
 
 bool cDynamicDevice::SetIdleDevice(bool Idle, bool TestOnly)
@@ -552,6 +735,13 @@ bool cDynamicDevice::HasDecoder(void) const
   if (subDevice)
      return subDevice->HasDecoder();
   return cDevice::HasDecoder();
+}
+
+cString cDynamicDevice::DeviceName(void) const
+{
+  if (subDevice)
+     return subDevice->DeviceName();
+  return cString::sprintf("dynamite-cDynamicDevice-%d", index);
 }
 
 bool cDynamicDevice::AvoidRecording(void) const
@@ -640,6 +830,8 @@ void cDynamicDevice::CloseFilter(int Handle)
 
 bool cDynamicDevice::ProvidesSource(int Source) const
 {
+  if (!InternProvidesSource(Source))
+     return false;
   if (subDevice)
      return subDevice->ProvidesSource(Source);
   return cDevice::ProvidesSource(Source);
@@ -647,6 +839,8 @@ bool cDynamicDevice::ProvidesSource(int Source) const
 
 bool cDynamicDevice::ProvidesTransponder(const cChannel *Channel) const
 {
+  if (!InternProvidesSource(Channel->Source()))
+     return false;
   if (subDevice)
      return subDevice->ProvidesTransponder(Channel);
   return cDevice::ProvidesTransponder(Channel);
@@ -654,6 +848,8 @@ bool cDynamicDevice::ProvidesTransponder(const cChannel *Channel) const
 
 bool cDynamicDevice::ProvidesTransponderExclusively(const cChannel *Channel) const
 {
+  if (!InternProvidesSource(Channel->Source()))
+     return false;
   if (subDevice)
      return subDevice->ProvidesTransponderExclusively(Channel);
   return cDevice::ProvidesTransponderExclusively(Channel);
@@ -661,6 +857,8 @@ bool cDynamicDevice::ProvidesTransponderExclusively(const cChannel *Channel) con
 
 bool cDynamicDevice::ProvidesChannel(const cChannel *Channel, int Priority, bool *NeedsDetachReceivers) const
 {
+  if (!InternProvidesSource(Channel->Source()))
+     return false;
   if (subDevice)
      return subDevice->ProvidesChannel(Channel, Priority, NeedsDetachReceivers);
   return cDevice::ProvidesChannel(Channel, Priority, NeedsDetachReceivers);
@@ -694,19 +892,33 @@ const cChannel *cDynamicDevice::GetCurrentlyTunedTransponder(void) const
   return cDevice::GetCurrentlyTunedTransponder();
 }
 
+
+#if VDRVERSNUM < 10722
 bool cDynamicDevice::IsTunedToTransponder(const cChannel *Channel)
+#else
+bool cDynamicDevice::IsTunedToTransponder(const cChannel *Channel) const
+#endif
 {
   if (!IsIdle() && subDevice)
      return subDevice->IsTunedToTransponder(Channel);
   return cDevice::IsTunedToTransponder(Channel);
 }
 
+#if VDRVERSNUM < 10722
 bool cDynamicDevice::MaySwitchTransponder(void)
 {
   if (subDevice)
      return subDevice->MaySwitchTransponder();
   return cDevice::MaySwitchTransponder();
 }
+#else
+bool cDynamicDevice::MaySwitchTransponder(const cChannel *Channel) const
+{
+  if (subDevice)
+     return subDevice->MaySwitchTransponder(Channel);
+  return cDevice::MaySwitchTransponder(Channel);
+}
+#endif
 
 bool cDynamicDevice::SetChannelDevice(const cChannel *Channel, bool LiveView)
 {
@@ -952,7 +1164,7 @@ void cDynamicDevice::CloseDvr(void)
 
 bool cDynamicDevice::GetTSPacket(uchar *&Data)
 {
-  if (subDevice) {
+  if (subDeviceIsReady && subDevice) {
      bool r = subDevice->GetTSPacket(Data);
      if (getTSTimeout > 0) {
         if (Data == NULL) {
@@ -980,15 +1192,16 @@ bool cDynamicDevice::GetTSPacket(uchar *&Data)
   return cDevice::GetTSPacket(Data);
 }
 
-#ifdef YAVDR_PATCHES
-//opt-21_internal-cam-devices.dpatch
+#ifdef INTERNAL_CAM_DEVICES_PATCH
 bool cDynamicDevice::HasInternalCam(void)
 {
   if (subDevice)
      return subDevice->HasInternalCam();
   return cDevice::HasInternalCam();
 }
+#endif
 
+#ifdef YAVDR_PATCHES
 //opt-44_rotor.dpatch 
 bool cDynamicDevice::SendDiseqcCmd(dvb_diseqc_master_cmd cmd)
 {
@@ -996,8 +1209,9 @@ bool cDynamicDevice::SendDiseqcCmd(dvb_diseqc_master_cmd cmd)
      return subDevice->SendDiseqcCmd(cmd);
   return cDevice::SendDiseqcCmd(cmd);
 }
+#endif
 
-//opt-64_lnb-sharing.dpatch 
+#ifdef LNB_SHARING_VERSION
 void cDynamicDevice::SetLnbNrFromSetup(void)
 {
   if (subDevice)

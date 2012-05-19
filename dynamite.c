@@ -9,8 +9,9 @@
 #include "dynamicdevice.h"
 #include "menu.h"
 #include "monitor.h"
+#include "status.h"
 
-static const char *VERSION        = "0.0.8a";
+static const char *VERSION        = "0.0.9e";
 static const char *DESCRIPTION    = tr("attach/detach devices on the fly");
 static const char *MAINMENUENTRY  = NULL;
 
@@ -110,14 +111,29 @@ cPluginDynamite::cPluginDynamite(void)
 
 cPluginDynamite::~cPluginDynamite()
 {
+  cDynamiteStatus::DeInit();
   cUdevMonitor::ShutdownAllMonitors();
   cUdev::Free();
-  if (cDynamicDevice::dvbprobe)
+  if (cDynamicDevice::idleHook != NULL) {
+     delete cDynamicDevice::idleHook;
+     cDynamicDevice::idleHook = NULL;
+     }
+  if (cDynamicDevice::attachHook != NULL) {
+     delete cDynamicDevice::attachHook;
+     cDynamicDevice::attachHook = NULL;
+     }
+  if (cDynamicDevice::dvbprobe) {
      delete cDynamicDevice::dvbprobe;
-  if (probe)
+     cDynamicDevice::dvbprobe = NULL;
+     }
+  if (probe) {
      delete probe;
-  if (getTSTimeoutHandler != NULL)
+     probe = NULL;
+     }
+  if (getTSTimeoutHandler != NULL) {
      delete getTSTimeoutHandler;
+     getTSTimeoutHandler = NULL;
+     }
 }
 
 const char *cPluginDynamite::CommandLineHelp(void)
@@ -130,6 +146,8 @@ const char *cPluginDynamite::CommandLineHelp(void)
          "    set program to be called on GetTS-timeout\n"
          "  --free-device-slots=n\n"
          "    leave n slots free for non-dynamic devices\n"
+         "  --attach-hook=/path/to/program\n"
+         "    set program to be called on device attach\n"
          "  --idle-hook=/path/to/program\n"
          "    set program to be called on SetIdle and reactivation\n"
          "  --idle-timeout=m\n"
@@ -147,6 +165,7 @@ bool cPluginDynamite::ProcessArgs(int argc, char *argv[])
     {"GetTSTimeout", required_argument, 0, 't'},
     {"GetTSTimeoutHandler", required_argument, 0, 'h'},
     {"free-device-slots", required_argument, 0, 'f'},
+    {"attach-hook", required_argument, 0, 'a'},
     {"idle-hook", required_argument, 0, 'i'},
     {"idle-timeout", required_argument, 0, 'I'},
     {"idle-wakeup", required_argument, 0, 'W'},
@@ -155,7 +174,7 @@ bool cPluginDynamite::ProcessArgs(int argc, char *argv[])
 
   while (true) {
         int option_index = 0;
-        int c = getopt_long(argc, argv, "udt:h:f:i:I:W:", options, &option_index);
+        int c = getopt_long(argc, argv, "udt:h:f:a:i:I:W:", options, &option_index);
         if (c == -1)
            break;
         switch (c) {
@@ -196,6 +215,17 @@ bool cPluginDynamite::ProcessArgs(int argc, char *argv[])
                    freeDeviceSlots = tmp;
                 else
                    esyslog("dynamite: \"%d\" free device slots is out of range", tmp);
+                }
+             break;
+           }
+          case 'a':
+           {
+             if (cDynamicDevice::attachHook != NULL)
+                delete cDynamicDevice::attachHook;
+             cDynamicDevice::attachHook = NULL;
+             if (optarg != NULL) {
+                cDynamicDevice::attachHook = new cString(optarg);
+                isyslog("dynamite: installing attach-hook %s", **cDynamicDevice::attachHook);
                 }
              break;
            }
@@ -260,6 +290,7 @@ bool cPluginDynamite::Initialize(void)
   // look for all dvb devices
   cList<cUdevDevice> *devices = cUdev::EnumDevices("dvb", "DVB_DEVICE_TYPE", "frontend");
   if (devices != NULL) {
+     devices->Sort();
      int dummy = 0;
      for (cUdevDevice *d = devices->First(); d; d = devices->Next(d)) {
          const char *devpath = d->GetDevnode();
@@ -278,6 +309,8 @@ bool cPluginDynamite::Initialize(void)
 
 bool cPluginDynamite::Start(void)
 {
+  cDynamiteStatus::Init();
+
   if (!cDynamicDevice::ProcessQueuedCommands())
      esyslog("dynamite: can't process all queued commands");
   return true;
@@ -354,6 +387,15 @@ bool cPluginDynamite::SetupParse(const char *Name, const char *Value)
      else
         esyslog("dynamite: \"%d\" free device slots is out of range", tmp);
      }
+  else if (strcasecmp(Name, "AttachHook") == 0) {
+     if (cDynamicDevice::attachHook != NULL)
+        delete cDynamicDevice::attachHook;
+     cDynamicDevice::attachHook = NULL;
+     if (Value != NULL) {
+        cDynamicDevice::attachHook = new cString(Value);
+        isyslog("dynamite: installing attach-hook %s", **cDynamicDevice::attachHook);
+        }
+     }
   else if (strcasecmp(Name, "IdleHook") == 0) {
      if (cDynamicDevice::idleHook != NULL)
         delete cDynamicDevice::idleHook;
@@ -423,6 +465,16 @@ bool cPluginDynamite::Service(const char *Id, void *Data)
   if (strcmp(Id, "dynamite-SetNotIdle-v0.1") == 0) {
      if (Data != NULL)
         cDynamicDevice::SetIdle((const char*)Data, false);
+     return true;
+     }
+  if (strcmp(Id, "dynamite-DisableAutoIdle-v0.1") == 0) {
+     if (Data != NULL)
+        cDynamicDevice::SetAutoIdle((const char*)Data, true);
+     return true;
+     }
+  if (strcmp(Id, "dynamite-EnableAutoIdle-v0.1") == 0) {
+     if (Data != NULL)
+        cDynamicDevice::SetAutoIdle((const char*)Data, false);
      return true;
      }
   if (strcmp(Id, "dynamite-SetGetTSTimeout-v0.1") == 0) {
@@ -517,6 +569,10 @@ const char **cPluginDynamite::SVDRPHelpPages(void)
     "    and can close all its handles",
     "SetNotIdle /dev/path/to/device\n"
     "    Revoke the idle state of the device",
+    "DisableAutoIdle /dev/path/to/device\n"
+    "    disables the auto-idle mode on this device if configured",
+    "EnableAutoIdle /dev/path/to/device\n"
+    "    enables the auto-idle mode on this device if configured",
     "LSTD\n"
     "    Lists all devices managed by this plugin. The first column is an id,\n"
     "    the second column is the devicepath passed with ATTD\n"
@@ -629,6 +685,28 @@ cString cPluginDynamite::SVDRPCommand(const char *Command, const char *Option, i
         {
           ReplyCode = 550;
           return cString::sprintf("can't set device %s to %s and I don't know why...", Option, (idle == 1 ? "idle" : "not idle"));
+        }
+       }
+     }
+
+  int autoidle = 0;
+  if (strcasecmp(Command, "DisableAutoIdle") == 0)
+     autoidle = 1;
+  else if (strcasecmp(Command, "EnableAutoIdle") == 0)
+     autoidle = 2;
+  if (autoidle > 0) {
+     switch (cDynamicDevice::SetAutoIdle(Option, (autoidle == 1))) {
+       case ddrcSuccess:
+         return cString::sprintf("%s auto-idle mode on device %s", (autoidle == 1 ? "disabled" : "enabled"), Option);
+       case ddrcNotFound:
+        {
+          ReplyCode = 550;
+          return cString::sprintf("device %s not found", Option);
+        }
+       default:
+        {
+          ReplyCode = 550;
+          return cString::sprintf("can't %s auto-idle mode on device %s and I don't know why...", (autoidle == 1 ? "disable" : "enable"), Option);
         }
        }
      }
