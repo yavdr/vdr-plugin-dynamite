@@ -14,5 +14,12 @@ Description: A VDR plugin add hotplug functionality to the vdr
  This is achieved by wrapping a helper device around cDvbDevice which
  checks if the hardware is available.
 
- 
+Package: vdr-plugin-dynamite-dbg
+Architecture: any
+Section: debug
+Priority: extra
+Depends: vdr-plugin-dynamite (= ${binary:Version}), ${misc:Depends}
+Description: debugging symbols for vdr-plugin-dynamite
+ .
+ This package contains only the debugging symbols for vdr-plugin-dynamite
 

@@ -1,4 +1,2 @@
-libvdr-dynamite.so.*    usr/lib/vdr/plugins/
 debian/plugin.dynamite.conf    etc/vdr/plugins/
-#debian/tmp/usr/share/locale
 
