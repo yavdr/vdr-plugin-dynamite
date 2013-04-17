@@ -1,3 +1,9 @@
+vdr-plugin-dynamite (0.1.5-0yavdr0~precise) precise; urgency=medium
+
+  * new upstream release
+
+ -- Lars Hanisch <dvb@flensrocker.de>  Wed, 17 Apr 2013 22:01:26 +0200
+
 vdr-plugin-dynamite (0.1.4-0yavdr0~precise) precise; urgency=medium
 
   * new upstream release
