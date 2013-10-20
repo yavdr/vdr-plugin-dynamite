@@ -1,3 +1,9 @@
+vdr-plugin-dynamite (0.1.5-1yavdr0~precise) precise; urgency=medium
+
+  * install README as docs
+
+ -- Lars Hanisch <dvb@flensrocker.de>  Sun, 20 Oct 2013 14:21:41 +0200
+
 vdr-plugin-dynamite (0.1.5-0yavdr0~precise) precise; urgency=medium
 
   * new upstream release
