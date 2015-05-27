@@ -20,9 +20,6 @@ set -e
 
 case "$1" in
     purge)
-        if [ -e /etc/vdr/plugins/order.conf ]; then
-            sed -i -e "/^[^#]*dynamite/d" /etc/vdr/plugins/order.conf
-        fi
     ;;
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
     ;;

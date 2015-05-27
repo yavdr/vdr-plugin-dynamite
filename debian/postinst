@@ -20,11 +20,6 @@ set -e
 
 case "$1" in
     configure)
-        if [ -e /etc/vdr/plugins/order.conf ]; then
-            if ! grep -q "^[^#]*dynamite" /etc/vdr/plugins/order.conf ; then
-                echo "*dynamite" >>/etc/vdr/plugins/order.conf;
-            fi
-        fi
     ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)
